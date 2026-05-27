@@ -190,14 +190,19 @@ class HandLandmarkDetector:
         """
         Process one raw (unflipped) camera frame.
 
-        hand_orientation='Front' activates the hybrid ML + curl-angle classifier
-        (front_on_classifier.classify_front_on), which works reliably for both
-        palm-facing and side-on hand positions without any settings change.
+        Mirrors the exact call pattern used in ~/rps_hand_counter/main.py:
+          - hand_orientation='Side'  (project default; Side = hand viewed in profile)
+          - display_mode='Game'      (no diagnostic skeleton overlay)
+          - target_hand='Auto'       (pick whichever hand is closest to camera)
+        process_hand_frame flips the frame internally and returns it; we discard
+        the returned frame here because the main canvas is managed separately.
         """
         _, hand_state, _ = process_hand_frame(
             raw_frame,
             self._hands,
-            hand_orientation='Front',
+            target_hand='Auto',
+            display_mode='Game',
+            hand_orientation='Side',
             _ema_state=self._ema,
         )
         tracker_out = self._tracker.update(hand_state.get('raw_gesture', 'Unknown'))
@@ -224,6 +229,11 @@ menu_sel = 0         # 0=Cheat, 1=Challenge, 2=Mirror
 _ble_last_cheat_cmd     = None
 _ble_last_challenge_cmd = None
 
+# Result-screen state (WIN / LOSE)
+result_show_time       = 0.0      # time.monotonic() when the screen was entered
+result_player_gesture  = 'Unknown'
+result_robot_gesture   = 'Unknown'
+
 # =============================================================================
 # Drawing helpers
 # =============================================================================
@@ -244,6 +254,29 @@ def _flash_enter_prompt(frame, now, y=None):
         if y is None:
             y = SCREEN_H * 3 // 4 + 60
         _text_centred(frame, "Press ENTER to continue", y, scale=1.2)
+
+
+def _draw_bottom_bar(frame, alpha=0.70):
+    """
+    Paint a full-width semi-transparent black pill across y=750..800.
+    Caller draws text on top afterwards.
+    alpha: opacity of the black layer (0=transparent, 1=opaque).
+    """
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 750), (SCREEN_W, SCREEN_H), (0, 0, 0), cv2.FILLED)
+    cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0, frame)
+
+
+def _enter_result_screen(screen_name, player_gest='Unknown', robot_gest='Unknown'):
+    """
+    Transition to WIN or LOSE screen, recording the timestamp and gestures
+    so draw_result() can show an overlay and enforce the 2.5-second lock-out.
+    """
+    global screen, result_show_time, result_player_gesture, result_robot_gesture
+    screen                = screen_name
+    result_show_time      = time.monotonic()
+    result_player_gesture = player_gest
+    result_robot_gesture  = robot_gest
 
 
 # =============================================================================
@@ -268,9 +301,16 @@ def draw_menu(frame, sel):
 
 def _composite_camera_circles(bg, raw_frame, circles):
     """
-    For each detected green circle: crop the corresponding region from a
-    mirror-flipped, screen-scaled camera frame and blend it into the background
-    using a circular alpha mask.
+    For each detected green circle: composite a ZOOMED-OUT view of the camera
+    feed into the circle, showing more of the room rather than a tight crop.
+
+    Zoom-out strategy (per spec):
+      1. Scale the flipped camera DOWN so max(cam_h, cam_w) maps to
+         circle_diameter × 1.8.  This means the frame is smaller than the
+         circle, so when we centre-crop to circle_d × circle_d we see
+         ~55 % of the camera area — giving the player visible context.
+      2. Centre-crop the scaled frame to (circle_d × circle_d).
+      3. Apply a circular alpha mask and composite onto the background.
 
     Returns the composited image (same dimensions as bg).
     """
@@ -278,12 +318,43 @@ def _composite_camera_circles(bg, raw_frame, circles):
     if not circles:
         return result
 
-    # Flip + resize once for all circles
-    cam = cv2.resize(cv2.flip(raw_frame, 1), (SCREEN_W, SCREEN_H))
+    cam     = cv2.flip(raw_frame, 1)
+    cam_h, cam_w = cam.shape[:2]
 
     for (cx, cy, r) in circles:
         if r < 5:
             continue
+
+        circle_d = r * 2   # diameter in pixels
+
+        # ── Scale camera so it appears zoomed OUT inside the circle ──
+        scale = (circle_d / max(cam_h, cam_w)) * 1.8   # 1.8 shows more context
+        new_w = max(1, int(cam_w * scale))
+        new_h = max(1, int(cam_h * scale))
+        small = cv2.resize(cam, (new_w, new_h))
+
+        # ── Centre-crop to circle_d × circle_d ───────────────────────
+        crop_x1 = max(0, (new_w - circle_d) // 2)
+        crop_y1 = max(0, (new_h - circle_d) // 2)
+        crop_x2 = min(new_w, crop_x1 + circle_d)
+        crop_y2 = min(new_h, crop_y1 + circle_d)
+        crop     = small[crop_y1:crop_y2, crop_x1:crop_x2]
+        crop_h, crop_w = crop.shape[:2]
+
+        # Pad to exactly circle_d × circle_d if crop landed short of an edge
+        if crop_h < circle_d or crop_w < circle_d:
+            padded = np.zeros((circle_d, circle_d, 3), dtype=np.uint8)
+            off_y  = (circle_d - crop_h) // 2
+            off_x  = (circle_d - crop_w) // 2
+            padded[off_y:off_y + crop_h, off_x:off_x + crop_w] = crop
+            crop = padded
+
+        # ── Circular mask on the (circle_d × circle_d) patch ─────────
+        mask     = np.zeros((circle_d, circle_d), dtype=np.uint8)
+        cv2.circle(mask, (r, r), r, 255, cv2.FILLED)
+        inv_mask = cv2.bitwise_not(mask)
+
+        # ── Destination bounds on the background canvas ───────────────
         x1 = max(0, cx - r)
         y1 = max(0, cy - r)
         x2 = min(SCREEN_W, cx + r)
@@ -292,15 +363,10 @@ def _composite_camera_circles(bg, raw_frame, circles):
         if rw <= 0 or rh <= 0:
             continue
 
-        cam_crop = cam[y1:y2, x1:x2].copy()
-
-        # Circular mask in the local (rw × rh) coordinate space
-        mask = np.zeros((rh, rw), dtype=np.uint8)
-        cv2.circle(mask, (cx - x1, cy - y1), r, 255, cv2.FILLED)
-
-        inv_mask = cv2.bitwise_not(mask)
-        cam_part = cv2.bitwise_and(cam_crop, cam_crop, mask=mask)
-        bg_part  = cv2.bitwise_and(result[y1:y2, x1:x2], result[y1:y2, x1:x2], mask=inv_mask)
+        cam_part = cv2.bitwise_and(crop[:rh, :rw], crop[:rh, :rw],
+                                   mask=mask[:rh, :rw])
+        bg_part  = cv2.bitwise_and(result[y1:y2, x1:x2], result[y1:y2, x1:x2],
+                                   mask=inv_mask[:rh, :rw])
         result[y1:y2, x1:x2] = cv2.add(cam_part, bg_part)
 
     return result
@@ -330,12 +396,15 @@ def draw_cheat(frame, hand_state, raw_frame):
     elif out.get('state') != 'ROUND_RESULT':
         _ble_last_cheat_cmd = None    # reset dedup after round ends
 
-    # ── HUD: Round / gesture summary — top-left, font scale 0.8
-    rn  = out.get('session_round', 1)
-    lp  = out.get('last_player',  '--')
-    lr  = out.get('last_robot',   '--')
-    hud = f"Round {rn}  --  YOU: {lp}  ROBOT: {lr}"
-    cv2.putText(frame, hud, (20, 44), FONT, 0.8, WHITE, 2, cv2.LINE_AA)
+    # ── HUD: semi-transparent bottom bar with round / score summary ──
+    rn      = out.get('session_round', 1)
+    p_score = out.get('player_score',  0)
+    r_score = out.get('robot_score',   0)
+    _draw_bottom_bar(frame, alpha=0.70)
+    cv2.putText(frame,
+                f"Round {rn}   YOU {p_score}  —  ROBOT {r_score}",
+                (50, 785),
+                cv2.FONT_HERSHEY_DUPLEX, 0.9, WHITE, 2, cv2.LINE_AA)
 
     # ── State text overlay (countdown / SHOOT / result banner)
     state = out.get('state', '')
@@ -393,13 +462,26 @@ def draw_challenge(frame, hand_state):
     elif out.get('state') not in ('ROUND_RESULT', 'MATCH_RESULT'):
         _ble_last_challenge_cmd = None
 
-    # ── Score overlay — bottom-centre, large (scale 1.5)
+    # ── Bottom bar: ROUND on left, score on right ─────────────────────
     p_score = out.get('player_score', 0)   # = current streak
     r_score = out.get('robot_score',  0)   # = high score
-    score   = f"YOU  {p_score}  --  ROBOT  {r_score}"
-    _text_centred(frame, score, SCREEN_H - 55, scale=1.5)
+    rn      = out.get('round_number', 1)
 
-    # ── Main state text
+    _draw_bottom_bar(frame, alpha=0.70)
+
+    # ROUND N — bottom-left
+    cv2.putText(frame, f"ROUND {rn}",
+                (50, 785),
+                cv2.FONT_HERSHEY_DUPLEX, 0.9, WHITE, 2, cv2.LINE_AA)
+
+    # YOU P — ROBOT R — bottom-right (right-justified)
+    score_str = f"YOU {p_score}  —  ROBOT {r_score}"
+    (sw, _), _ = cv2.getTextSize(score_str, cv2.FONT_HERSHEY_DUPLEX, 0.9, 2)
+    cv2.putText(frame, score_str,
+                (SCREEN_W - sw - 50, 785),
+                cv2.FONT_HERSHEY_DUPLEX, 0.9, WHITE, 2, cv2.LINE_AA)
+
+    # ── Main state text — skip ROUND_INTRO to avoid overlapping character ──
     state = out.get('state', '')
     main  = out.get('main_text', '')
     sub   = out.get('sub_text',  '')
@@ -408,16 +490,12 @@ def draw_challenge(frame, hand_state):
         beats = out.get('beat_count', 0)
         label = str(min(beats, 3)) if beats > 0 else "READY"
         _text_centred(frame, label, SCREEN_H // 2 - 40, scale=3.5)
-    elif main:
+    elif state != 'ROUND_INTRO' and main:
+        # ROUND_INTRO text ("ROUND N") is already in the bottom bar — skip it here
         _text_centred(frame, main, SCREEN_H // 2 - 40, scale=2.2)
 
-    if sub:
+    if sub and state != 'ROUND_INTRO':
         _text_centred(frame, sub, SCREEN_H // 2 + 40, scale=0.85)
-
-    # ── Round counter — top-right
-    rn = out.get('round_number', 1)
-    rt = out.get('round_text', f"ROUND {rn}")
-    cv2.putText(frame, rt, (SCREEN_W - 280, 44), FONT, 0.85, WHITE, 2, cv2.LINE_AA)
 
     # ── Win/lose transition trigger from AppChallengeController
     trigger = out.get('trigger_game_over')   # 'WIN', 'LOSE', or None
@@ -474,18 +552,47 @@ def draw_mirror(frame, hand_state):
 # ── WIN / LOSE ────────────────────────────────────────────────────────────────
 
 def draw_result(frame, result_type, now):
-    """result_type: 'win' or 'lose'."""
+    """
+    result_type: 'win' or 'lose'.
+    Shows the full-screen result background, then overlays a semi-transparent
+    panel in the bottom third with the gestures both sides threw.
+    The 'Press ENTER to continue' prompt only appears after 2.5 seconds.
+    """
     frame[:] = ASSETS['you_win' if result_type == 'win' else 'you_lose']
-    _flash_enter_prompt(frame, now, y=SCREEN_H - 80)
+
+    # ── Dark semi-transparent panel, bottom third ─────────────────────
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (200, 560), (1080, 760), (0, 0, 0), cv2.FILLED)
+    cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
+
+    # ── Gesture labels ────────────────────────────────────────────────
+    cv2.putText(frame,
+                f"YOU threw: {result_player_gesture}",
+                (240, 630),
+                cv2.FONT_HERSHEY_DUPLEX, 1.2, WHITE, 2, cv2.LINE_AA)
+    cv2.putText(frame,
+                f"ROBOT threw: {result_robot_gesture}",
+                (240, 700),
+                cv2.FONT_HERSHEY_DUPLEX, 1.2, (200, 200, 200), 2, cv2.LINE_AA)
+
+    # ── 'Press ENTER' — only visible after the 2.5-second lock-out ───
+    if now - result_show_time > 2.5:
+        cv2.putText(frame,
+                    "Press ENTER to continue",
+                    (440, 750),
+                    FONT, 0.8, (255, 220, 50), 2, cv2.LINE_AA)
 
 
 # =============================================================================
 # Key handler
 # =============================================================================
 
-def handle_keys(key):
+def handle_keys(key, now):
     """
     Update the global screen / menu_sel from a waitKey() result.
+
+    now: time.monotonic() value from the current frame — used to enforce
+         the 2.5-second dismissal lock on the WIN / LOSE screens.
 
     Navigation:
         ESC           — back to previous screen
@@ -516,7 +623,9 @@ def handle_keys(key):
             mirror_state.stop()
             screen = 'MENU'
         elif screen in ('WIN', 'LOSE'):
-            screen = 'MENU'
+            # Enforce 2.5-second minimum display before allowing dismissal
+            if now - result_show_time > 2.5:
+                screen = 'MENU'
         elif screen == 'MENU':
             screen = 'TITLE'
 
@@ -537,7 +646,9 @@ def handle_keys(key):
                 screen = 'MIRROR'
 
         elif screen in ('WIN', 'LOSE'):
-            screen = 'MENU'
+            # Enforce 2.5-second minimum display before allowing dismissal
+            if now - result_show_time > 2.5:
+                screen = 'MENU'
 
     # ── LEFT / RIGHT arrows (menu navigation) ─────────────────────────
     elif left and screen == 'MENU':
@@ -590,7 +701,9 @@ while True:
     elif screen == 'CHALLENGE':
         trigger = draw_challenge(frame, hand_state)
         if trigger:                         # 'WIN' or 'LOSE'
-            screen = trigger
+            p_gest = challenge_ctrl._game_over_player_gesture or 'Unknown'
+            r_gest = challenge_ctrl._game_over_robot_gesture  or 'Unknown'
+            _enter_result_screen(trigger, p_gest, r_gest)
 
     elif screen == 'MIRROR':
         draw_mirror(frame, hand_state)
@@ -603,7 +716,7 @@ while True:
 
     # ── Keyboard ──────────────────────────────────────────────────────
     key = cv2.waitKey(1) & 0xFF
-    handle_keys(key)
+    handle_keys(key, now)
 
     # ── Display ───────────────────────────────────────────────────────
     cv2.imshow(WIN_NAME, frame)

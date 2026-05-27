@@ -44,8 +44,10 @@ class AppChallengeController(ChallengeController):
     # ------------------------------------------------------------------
 
     def _init_session(self):
-        self.session_wins       = 0
-        self._game_over_streak  = None   # streak value captured when MATCH_RESULT starts
+        self.session_wins              = 0
+        self._game_over_streak         = None   # streak value captured when MATCH_RESULT starts
+        self._game_over_player_gesture = None   # player's final throw (captured before reset)
+        self._game_over_robot_gesture  = None   # robot's final throw (captured before reset)
 
     def reset(self):
         """Full reset — call when re-entering challenge mode from the menu."""
@@ -81,10 +83,13 @@ class AppChallengeController(ChallengeController):
                 and self.last_round_result == "player_win"):
             self.session_wins += 1
 
-        # ── Entering MATCH_RESULT → save the winning streak ───────────
-        # self.streak has not been reset yet at this point
+        # ── Entering MATCH_RESULT → save streak + final gestures ─────
+        # self.streak / player_gesture / computer_gesture are intact at this
+        # point; reset_run() hasn't been called yet.
         if prev_state != "MATCH_RESULT" and self.state == "MATCH_RESULT":
-            self._game_over_streak = self.streak
+            self._game_over_streak         = self.streak
+            self._game_over_player_gesture = self.player_gesture
+            self._game_over_robot_gesture  = self.computer_gesture
 
         # ── Leaving MATCH_RESULT (reset_run called) → fire trigger ────
         trigger = None
