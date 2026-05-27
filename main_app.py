@@ -230,6 +230,7 @@ _ble_last_cheat_cmd     = None
 _ble_last_challenge_cmd = None
 
 # Result-screen state (WIN / LOSE)
+RESULT_MIN_DISPLAY     = 4.0      # seconds the result screen must stay visible
 result_show_time       = 0.0      # time.monotonic() when the screen was entered
 result_player_gesture  = 'Unknown'
 result_robot_gesture   = 'Unknown'
@@ -554,32 +555,41 @@ def draw_mirror(frame, hand_state):
 def draw_result(frame, result_type, now):
     """
     result_type: 'win' or 'lose'.
-    Shows the full-screen result background, then overlays a semi-transparent
-    panel in the bottom third with the gestures both sides threw.
-    The 'Press ENTER to continue' prompt only appears after 2.5 seconds.
+    Shows the full-screen result background, then overlays a tall semi-transparent
+    panel with the result word, gestures thrown, and (after RESULT_MIN_DISPLAY s)
+    the 'Press ENTER to continue' prompt.
     """
     frame[:] = ASSETS['you_win' if result_type == 'win' else 'you_lose']
 
-    # ── Dark semi-transparent panel, bottom third ─────────────────────
+    result_word = result_type.upper()   # 'WIN' or 'LOSE'
+
+    # ── Tall dark semi-transparent panel covering lower ~56 % of screen ──
     overlay = frame.copy()
-    cv2.rectangle(overlay, (200, 560), (1080, 760), (0, 0, 0), cv2.FILLED)
+    cv2.rectangle(overlay, (100, 500), (1180, 780), (0, 0, 0), cv2.FILLED)
     cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
 
-    # ── Gesture labels ────────────────────────────────────────────────
+    # ── Large result word at the top of the panel ─────────────────────
+    word_colour = (255, 220, 50) if result_word == 'WIN' else (80, 80, 220)
+    cv2.putText(frame,
+                result_word,
+                (SCREEN_W // 2 - 100, 560),
+                cv2.FONT_HERSHEY_DUPLEX, 2.5, word_colour, 4, cv2.LINE_AA)
+
+    # ── Gesture labels — larger, easier to read quickly ───────────────
     cv2.putText(frame,
                 f"YOU threw: {result_player_gesture}",
-                (240, 630),
-                cv2.FONT_HERSHEY_DUPLEX, 1.2, WHITE, 2, cv2.LINE_AA)
+                (240, 640),
+                cv2.FONT_HERSHEY_DUPLEX, 1.6, WHITE, 3, cv2.LINE_AA)
     cv2.putText(frame,
                 f"ROBOT threw: {result_robot_gesture}",
-                (240, 700),
-                cv2.FONT_HERSHEY_DUPLEX, 1.2, (200, 200, 200), 2, cv2.LINE_AA)
+                (240, 710),
+                cv2.FONT_HERSHEY_DUPLEX, 1.6, (200, 200, 200), 3, cv2.LINE_AA)
 
-    # ── 'Press ENTER' — only visible after the 2.5-second lock-out ───
-    if now - result_show_time > 2.5:
+    # ── 'Press ENTER' — only visible after RESULT_MIN_DISPLAY seconds ─
+    if now - result_show_time > RESULT_MIN_DISPLAY:
         cv2.putText(frame,
                     "Press ENTER to continue",
-                    (440, 750),
+                    (440, 760),
                     FONT, 0.8, (255, 220, 50), 2, cv2.LINE_AA)
 
 
@@ -624,7 +634,7 @@ def handle_keys(key, now):
             screen = 'MENU'
         elif screen in ('WIN', 'LOSE'):
             # Enforce 2.5-second minimum display before allowing dismissal
-            if now - result_show_time > 2.5:
+            if now - result_show_time > RESULT_MIN_DISPLAY:
                 screen = 'MENU'
         elif screen == 'MENU':
             screen = 'TITLE'
@@ -647,7 +657,7 @@ def handle_keys(key, now):
 
         elif screen in ('WIN', 'LOSE'):
             # Enforce 2.5-second minimum display before allowing dismissal
-            if now - result_show_time > 2.5:
+            if now - result_show_time > RESULT_MIN_DISPLAY:
                 screen = 'MENU'
 
     # ── LEFT / RIGHT arrows (menu navigation) ─────────────────────────
