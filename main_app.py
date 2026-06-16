@@ -7,9 +7,8 @@ Three modes accessible from a menu:
   Challenge — survival run; robot difficulty ramps with your streak.
   Mirror    — robot hand mirrors your finger curls via BLE.
 
-Camera runs every frame via MediaPipe hand tracking.  All drawing is
-done onto a 1280×800 canvas composited from background assets and
-live overlays.
+All visuals are drawn programmatically via ui_renderer.py — no image assets.
+Camera feed fills each gameplay screen; animated HUD overlays live on top.
 
 Usage:
     python3 main_app.py
@@ -17,6 +16,7 @@ Quit:
     press Q
 """
 
+import math
 import os
 import sys
 import time
@@ -24,24 +24,25 @@ import time
 import cv2
 import numpy as np
 
-# ── Shared modules from rps_hand_counter ─────────────────────────────────────
+# ── Shared modules from rps_hand_counter ────────────────────────────────────
 sys.path.insert(0, os.path.expanduser('~/rps_hand_counter'))
 
-from hand_landmarks import (          # MediaPipe wrapper + Kalman wrist filter
+from hand_landmarks import (
     process_hand_frame,
     create_hands_detector,
     create_kalman_wrist_state,
 )
-from gesture_state import GestureStateTracker   # multi-frame confirmation layer
-# gesture_mapper.classify_rps_gesture and front_on_classifier.classify_front_on
-# are called internally by process_hand_frame; no direct use needed here.
+from gesture_state import GestureStateTracker
 
-# ── Mode state modules (in this directory) ────────────────────────────────────
+# ── Mode state modules ───────────────────────────────────────────────────────
 from app_cheat_state     import CheatController
 from app_challenge_state import AppChallengeController
 from app_mirror_state    import AppMirrorState
 
-# ── Optional BLE bridge (graceful fallback) ───────────────────────────────────
+# ── Visual design system ────────────────────────────────────────────────────
+import ui_renderer as UI
+
+# ── Optional BLE bridge ──────────────────────────────────────────────────────
 try:
     from ble_bridge import BLEBridge
     ble = BLEBridge()
@@ -58,20 +59,14 @@ except Exception as _ble_err:
 SCREEN_W, SCREEN_H = 1280, 800
 WIN_NAME = "RPS Robot"
 
-ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets')
+RESULT_MIN_DISPLAY    = 4.0        # seconds the result screen must stay visible
+result_show_time      = 0.0
+result_player_gesture = 'Unknown'
+result_robot_gesture  = 'Unknown'
 
-FONT       = cv2.FONT_HERSHEY_SIMPLEX
-WHITE      = (255, 255, 255)
-ACCENT_BGR = (210, 160, 60)   # accent blue for mirror bars  (BGR order)
-DARK_GREY  = (50,  50,  50)
-
-# Bar layout for Mirror mode
-_CURL_LABELS = ['THUMB', 'INDEX', 'MIDDLE', 'RING']
-_BAR_X       = 40
-_BAR_W       = 300
-_BAR_H       = 20
-_BAR_Y0      = 520    # top of first bar
-_BAR_STEP    = 65     # label-to-label spacing (label height ~18 + bar 20 + gap ~27)
+# BLE dedup: avoid re-sending the same command every frame
+_ble_last_cheat_cmd     = None
+_ble_last_challenge_cmd = None
 
 # =============================================================================
 # Window setup
@@ -81,122 +76,18 @@ cv2.namedWindow(WIN_NAME, cv2.WINDOW_NORMAL)
 cv2.setWindowProperty(WIN_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
 # =============================================================================
-# Asset loading
-# =============================================================================
-
-def _load_asset(filename):
-    """Load one PNG from the assets directory, resize to screen dimensions."""
-    path = os.path.join(ASSETS_DIR, filename)
-    img  = cv2.imread(path)
-    if img is None:
-        # Graceful fallback: black frame with filename as label
-        img = np.zeros((SCREEN_H, SCREEN_W, 3), dtype=np.uint8)
-        cv2.putText(img, f"[missing: {filename}]", (40, SCREEN_H // 2),
-                    FONT, 1.0, WHITE, 2, cv2.LINE_AA)
-        print(f"[warn] could not load asset: {path}")
-    else:
-        img = cv2.resize(img, (SCREEN_W, SCREEN_H))
-    return img
-
-
-ASSETS = {
-    'title':          _load_asset('TitleScreen.png'),
-    'menu_cheat':     _load_asset('RPSCheatSelected.png'),
-    'menu_challenge': _load_asset('RPSChallengeSelected.png'),
-    'menu_mirror':    _load_asset('RPSMirrorSelected.png'),
-    'cheat':          _load_asset('CheatMode.png'),          # has green chroma circles
-    'ch_idle':        _load_asset('ChallengeIdle.png'),
-    'ch_angry1':      _load_asset('ChallengeAngry1.png'),    # 3+ player wins
-    'ch_angry2':      _load_asset('ChallengeAngry2.png'),    # 5+ player wins
-    'ch_angry3':      _load_asset('ChallengeAngry3.png'),    # 8+ player wins
-    'you_win':        _load_asset('YouWin.png'),
-    'you_lose':       _load_asset('YouLose.png'),
-    'mirror_bg':      _load_asset('CheatMode.png'),          # reused for Mirror mode
-}
-
-# =============================================================================
-# Green-circle detection (for Cheat mode chroma-key)
-# =============================================================================
-
-def _detect_green_circles(bg_image):
-    """
-    Find the two solid #00FF00 circles in the Cheat Mode background image.
-
-    Strategy:
-      1. Convert to HSV.
-      2. Threshold for near-pure green (H≈60°, S/V near max).
-      3. Find contours, keep the two largest.
-      4. Return list of (cx, cy, radius) tuples in SCREEN_W×SCREEN_H coordinates.
-
-    Returns an empty list when no matching regions exist.
-    """
-    hsv   = cv2.cvtColor(bg_image, cv2.COLOR_BGR2HSV)
-    # Pure #00FF00: OpenCV H=60, S=255, V=255
-    lower = np.array([55, 200, 200])
-    upper = np.array([65, 255, 255])
-    mask  = cv2.inRange(hsv, lower, upper)
-
-    # Fill small gaps that can appear at JPEG artefact boundaries
-    kernel = np.ones((5, 5), np.uint8)
-    mask   = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:2]
-
-    circles = []
-    for c in contours:
-        if cv2.contourArea(c) < 300:   # discard tiny noise blobs
-            continue
-        (x, y), r = cv2.minEnclosingCircle(c)
-        circles.append((int(x), int(y), int(r)))
-
-    if circles:
-        print(f"[cheat] detected {len(circles)} chroma circle(s): {circles}")
-    else:
-        print("[cheat] no green circles found in CheatMode.png — camera overlay disabled")
-    return circles
-
-
-# Detect once at startup (background is already screen-sized)
-CHEAT_CIRCLES = _detect_green_circles(ASSETS['cheat'])
-
-# =============================================================================
-# HandLandmarkDetector — wraps MediaPipe + GestureStateTracker
+# Hand landmark detector
 # =============================================================================
 
 class HandLandmarkDetector:
-    """
-    Bundles MediaPipe Hands, a Kalman wrist filter, and a multi-frame
-    gesture confirmation tracker into a single process() call.
-
-    process(raw_frame) returns a hand_state dict containing:
-        raw_gesture        — single-frame MediaPipe classification
-        stable_gesture     — majority-voted over a short window
-        confirmed_gesture  — held steady for N frames (most reliable)
-        robot_ready        — True when it is safe to act on the gesture
-        wrist_y            — Kalman-smoothed wrist Y  (0=top, 1=bottom)
-        raw_wrist_y        — unsmoothed wrist Y for pump-beat detection
-        _landmarks         — raw MediaPipe NormalizedLandmarkList
-        _world_landmarks   — rotation-invariant world-space landmarks
-        … plus all other fields from process_hand_frame()
-    """
+    """Bundles MediaPipe Hands + Kalman wrist filter + multi-frame tracker."""
 
     def __init__(self):
-        self._hands     = create_hands_detector()
-        self._ema       = create_kalman_wrist_state()
-        self._tracker   = GestureStateTracker()
+        self._hands   = create_hands_detector()
+        self._ema     = create_kalman_wrist_state()
+        self._tracker = GestureStateTracker()
 
     def process(self, raw_frame):
-        """
-        Process one raw (unflipped) camera frame.
-
-        Mirrors the exact call pattern used in ~/rps_hand_counter/main.py:
-          - hand_orientation='Side'  (project default; Side = hand viewed in profile)
-          - display_mode='Game'      (no diagnostic skeleton overlay)
-          - target_hand='Auto'       (pick whichever hand is closest to camera)
-        process_hand_frame flips the frame internally and returns it; we discard
-        the returned frame here because the main canvas is managed separately.
-        """
         _, hand_state, _ = process_hand_frame(
             raw_frame,
             self._hands,
@@ -210,7 +101,7 @@ class HandLandmarkDetector:
         return hand_state
 
 # =============================================================================
-# Game state objects (one each, shared across the lifetime of the app)
+# Game state objects
 # =============================================================================
 
 detector       = HandLandmarkDetector()
@@ -219,171 +110,92 @@ challenge_ctrl = AppChallengeController()
 mirror_state   = AppMirrorState(ble_bridge=ble)
 
 # =============================================================================
-# App-level state
+# App state
 # =============================================================================
 
 screen   = 'TITLE'   # TITLE | MENU | CHEAT | CHALLENGE | MIRROR | WIN | LOSE
-menu_sel = 0         # 0=Cheat, 1=Challenge, 2=Mirror
-
-# BLE dedup: avoid re-sending the same command every frame
-_ble_last_cheat_cmd     = None
-_ble_last_challenge_cmd = None
-
-# Result-screen state (WIN / LOSE)
-RESULT_MIN_DISPLAY     = 4.0      # seconds the result screen must stay visible
-result_show_time       = 0.0      # time.monotonic() when the screen was entered
-result_player_gesture  = 'Unknown'
-result_robot_gesture   = 'Unknown'
-
-# =============================================================================
-# Drawing helpers
-# =============================================================================
-
-def _text_centred(frame, text, y, scale=1.0, colour=WHITE, thickness=2):
-    """Draw text horizontally centred on the canvas at the given Y baseline."""
-    (tw, _), _ = cv2.getTextSize(text, FONT, scale, thickness)
-    x = (SCREEN_W - tw) // 2
-    cv2.putText(frame, text, (x, y), FONT, scale, colour, thickness, cv2.LINE_AA)
-
-
-def _flash_enter_prompt(frame, now, y=None):
-    """
-    Draw 'Press ENTER to continue' centred in the bottom quarter.
-    Toggles every 500 ms using time.monotonic().
-    """
-    if int(now * 2) % 2 == 0:
-        if y is None:
-            y = SCREEN_H * 3 // 4 + 60
-        _text_centred(frame, "Press ENTER to continue", y, scale=1.2)
-
-
-def _draw_bottom_bar(frame, alpha=0.70):
-    """
-    Paint a full-width semi-transparent black pill across y=750..800.
-    Caller draws text on top afterwards.
-    alpha: opacity of the black layer (0=transparent, 1=opaque).
-    """
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 750), (SCREEN_W, SCREEN_H), (0, 0, 0), cv2.FILLED)
-    cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0, frame)
+menu_sel = 0         # 0=Cheat 1=Challenge 2=Mirror
 
 
 def _enter_result_screen(screen_name, player_gest='Unknown', robot_gest='Unknown'):
-    """
-    Transition to WIN or LOSE screen, recording the timestamp and gestures
-    so draw_result() can show an overlay and enforce the 2.5-second lock-out.
-    """
     global screen, result_show_time, result_player_gesture, result_robot_gesture
     screen                = screen_name
     result_show_time      = time.monotonic()
     result_player_gesture = player_gest
     result_robot_gesture  = robot_gest
 
+# =============================================================================
+# Mirror-mode curl bars (drawn inline, styled with neon palette)
+# =============================================================================
+
+_CURL_LABELS = ['THUMB', 'INDEX', 'MIDDLE', 'RING']
+_BAR_X  = 30
+_BAR_W  = 260
+_BAR_H  = 18
+_BAR_Y0 = 90     # y of first bar top (clears top HUD bar)
+_BAR_STEP = 52
+
+
+def _draw_mirror_bars(frame, curls):
+    """Four neon curl bars in the top-left corner for Mirror mode."""
+    col   = UI.P['cyan']
+    dark  = UI.P['dark_grey']
+    panel = UI.P['panel']
+
+    for i, (label, val) in enumerate(zip(_CURL_LABELS, curls)):
+        y_lbl = _BAR_Y0 + i * _BAR_STEP
+        y_bar = y_lbl + 20
+
+        # Label
+        cv2.putText(frame, label, (_BAR_X, y_lbl),
+                    UI.FS, 0.60, col, 1, cv2.LINE_AA)
+
+        # Track — dark fill + border
+        cv2.rectangle(frame, (_BAR_X, y_bar), (_BAR_X + _BAR_W, y_bar + _BAR_H),
+                      panel, cv2.FILLED)
+        cv2.rectangle(frame, (_BAR_X, y_bar), (_BAR_X + _BAR_W, y_bar + _BAR_H),
+                      dark, 1)
+
+        # Fill proportional to 0-100 curl value
+        fill_w = int(_BAR_W * max(0, min(100, val)) / 100)
+        if fill_w > 0:
+            cv2.rectangle(frame, (_BAR_X, y_bar), (_BAR_X + fill_w, y_bar + _BAR_H),
+                          col, cv2.FILLED)
+
+        # Percentage label
+        pct = f"{val}%"
+        cv2.putText(frame, pct, (_BAR_X + _BAR_W + 8, y_bar + _BAR_H - 2),
+                    UI.FS, 0.55, col, 1, cv2.LINE_AA)
 
 # =============================================================================
 # Screen draw functions
 # =============================================================================
 
-# ── TITLE ─────────────────────────────────────────────────────────────────────
+# ── TITLE ────────────────────────────────────────────────────────────────────
 
 def draw_title(frame, now):
-    frame[:] = ASSETS['title']
-    _flash_enter_prompt(frame, now)
+    UI.draw_title_screen(frame, now)
 
 
-# ── MENU ──────────────────────────────────────────────────────────────────────
+# ── MENU ─────────────────────────────────────────────────────────────────────
 
-def draw_menu(frame, sel):
-    keys = ('menu_cheat', 'menu_challenge', 'menu_mirror')
-    frame[:] = ASSETS[keys[sel]]
-
-
-# ── CHEAT ─────────────────────────────────────────────────────────────────────
-
-def _composite_camera_circles(bg, raw_frame, circles):
-    """
-    For each detected green circle: composite a ZOOMED-OUT view of the camera
-    feed into the circle, showing more of the room rather than a tight crop.
-
-    Zoom-out strategy (per spec):
-      1. Scale the flipped camera DOWN so max(cam_h, cam_w) maps to
-         circle_diameter × 1.8.  This means the frame is smaller than the
-         circle, so when we centre-crop to circle_d × circle_d we see
-         ~55 % of the camera area — giving the player visible context.
-      2. Centre-crop the scaled frame to (circle_d × circle_d).
-      3. Apply a circular alpha mask and composite onto the background.
-
-    Returns the composited image (same dimensions as bg).
-    """
-    result = bg.copy()
-    if not circles:
-        return result
-
-    cam     = cv2.flip(raw_frame, 1)
-    cam_h, cam_w = cam.shape[:2]
-
-    for (cx, cy, r) in circles:
-        if r < 5:
-            continue
-
-        circle_d = r * 2   # diameter in pixels
-
-        # ── Scale camera so it appears zoomed OUT inside the circle ──
-        scale = (circle_d / max(cam_h, cam_w)) * 1.8   # 1.8 shows more context
-        new_w = max(1, int(cam_w * scale))
-        new_h = max(1, int(cam_h * scale))
-        small = cv2.resize(cam, (new_w, new_h))
-
-        # ── Centre-crop to circle_d × circle_d ───────────────────────
-        crop_x1 = max(0, (new_w - circle_d) // 2)
-        crop_y1 = max(0, (new_h - circle_d) // 2)
-        crop_x2 = min(new_w, crop_x1 + circle_d)
-        crop_y2 = min(new_h, crop_y1 + circle_d)
-        crop     = small[crop_y1:crop_y2, crop_x1:crop_x2]
-        crop_h, crop_w = crop.shape[:2]
-
-        # Pad to exactly circle_d × circle_d if crop landed short of an edge
-        if crop_h < circle_d or crop_w < circle_d:
-            padded = np.zeros((circle_d, circle_d, 3), dtype=np.uint8)
-            off_y  = (circle_d - crop_h) // 2
-            off_x  = (circle_d - crop_w) // 2
-            padded[off_y:off_y + crop_h, off_x:off_x + crop_w] = crop
-            crop = padded
-
-        # ── Circular mask on the (circle_d × circle_d) patch ─────────
-        mask     = np.zeros((circle_d, circle_d), dtype=np.uint8)
-        cv2.circle(mask, (r, r), r, 255, cv2.FILLED)
-        inv_mask = cv2.bitwise_not(mask)
-
-        # ── Destination bounds on the background canvas ───────────────
-        x1 = max(0, cx - r)
-        y1 = max(0, cy - r)
-        x2 = min(SCREEN_W, cx + r)
-        y2 = min(SCREEN_H, cy + r)
-        rw, rh = x2 - x1, y2 - y1
-        if rw <= 0 or rh <= 0:
-            continue
-
-        cam_part = cv2.bitwise_and(crop[:rh, :rw], crop[:rh, :rw],
-                                   mask=mask[:rh, :rw])
-        bg_part  = cv2.bitwise_and(result[y1:y2, x1:x2], result[y1:y2, x1:x2],
-                                   mask=inv_mask[:rh, :rw])
-        result[y1:y2, x1:x2] = cv2.add(cam_part, bg_part)
-
-    return result
+def draw_menu(frame, sel, now):
+    UI.draw_menu_screen(frame, sel, now)
 
 
-def draw_cheat(frame, hand_state, raw_frame):
+# ── CHEAT ────────────────────────────────────────────────────────────────────
+
+def draw_cheat(frame, hand_state, raw_frame, now):
     global _ble_last_cheat_cmd
 
-    # ── Background: cheat image with camera composited into green circles
-    frame[:] = _composite_camera_circles(ASSETS['cheat'], raw_frame, CHEAT_CIRCLES)
+    # Full-screen camera background (slightly darkened)
+    UI.draw_camera_bg(frame, raw_frame, darken=0.45)
 
-    # ── Update controller
+    # Update controller
     wrist_y = hand_state.get('raw_wrist_y')
     out     = cheat_ctrl.update(wrist_y, hand_state)
 
-    # ── BLE: send once per round when result arrives
+    # BLE — send once per round when result first arrives
     if ble is not None and out.get('state') == 'ROUND_RESULT':
         gest = out.get('computer_gesture', 'Unknown')
         if gest != 'Unknown':
@@ -395,61 +207,67 @@ def draw_cheat(frame, hand_state, raw_frame):
                 except Exception:
                     pass
     elif out.get('state') != 'ROUND_RESULT':
-        _ble_last_cheat_cmd = None    # reset dedup after round ends
+        _ble_last_cheat_cmd = None
 
-    # ── HUD: semi-transparent bottom bar with round / score summary ──
+    # Top HUD
     rn      = out.get('session_round', 1)
     p_score = out.get('player_score',  0)
     r_score = out.get('robot_score',   0)
-    _draw_bottom_bar(frame, alpha=0.70)
-    cv2.putText(frame,
-                f"Round {rn}   YOU {p_score}  —  ROBOT {r_score}",
-                (50, 785),
-                cv2.FONT_HERSHEY_DUPLEX, 0.9, WHITE, 2, cv2.LINE_AA)
+    UI.draw_top_hud(frame, 'CHEAT', f'ROUND {rn}',
+                    f'YOU {p_score}   ROBOT {r_score}')
 
-    # ── State text overlay (countdown / SHOOT / result banner)
+    # State text / countdown
     state = out.get('state', '')
     main  = out.get('main_text', '')
     sub   = out.get('sub_text',  '')
 
     if state == 'COUNTDOWN':
         beats = out.get('beat_count', 0)
-        label = str(min(beats, 3)) if beats > 0 else "READY"
-        _text_centred(frame, label, SCREEN_H // 2, scale=3.5)
-    elif main:
-        _text_centred(frame, main, SCREEN_H // 2, scale=2.0)
+        UI.draw_countdown(frame, str(min(beats, 3)) if beats > 0 else 'READY')
+    elif state == 'ROUND_RESULT' and main:
+        UI.draw_state_pill(frame, main, sub, colour_key='magenta')
+    elif main and state != 'ROUND_INTRO':
+        UI.draw_state_pill(frame, main, sub, colour_key='cyan')
 
-    if sub:
-        _text_centred(frame, sub, SCREEN_H // 2 + 60, scale=0.75)
+    # Robot face panel — shows what robot is playing, smug on result
+    robot_gest = out.get('computer_gesture', 'Unknown')
+    mood       = 'smug' if state == 'ROUND_RESULT' else 'neutral'
+    label      = f'ROBOT: {robot_gest}' if robot_gest not in ('Unknown', None) else 'ROBOT'
+    UI.draw_robot_panel(frame, mood=mood, now=now, gesture_label=label)
 
-    # Gesture detection status — bottom-left diagnostic
-    gest_now = hand_state.get('confirmed_gesture', 'Unknown')
-    det_txt  = f"Detected: {gest_now}"
-    cv2.putText(frame, det_txt, (20, SCREEN_H - 30), FONT, 0.65, WHITE, 1, cv2.LINE_AA)
+    # Gesture indicator (bottom-left, small)
+    UI.draw_gesture_indicator(frame, hand_state.get('confirmed_gesture', 'Unknown'))
 
 
-# ── CHALLENGE ─────────────────────────────────────────────────────────────────
+# ── CHALLENGE ────────────────────────────────────────────────────────────────
 
-def draw_challenge(frame, hand_state):
-    """
-    Draw the Challenge Mode screen.
+def _session_wins_to_mood(wins):
+    if wins >= 8:   return 'angry3'
+    if wins >= 5:   return 'angry2'
+    if wins >= 3:   return 'angry1'
+    return 'neutral'
 
-    Returns:
-        'WIN'  — if a game-over triggered and the player won ≥1 round
-        'LOSE' — if a game-over triggered and the player won 0 rounds
-        None   — normal frame, no transition needed
-    """
+
+def draw_challenge(frame, hand_state, raw_frame, now):
+    """Returns 'WIN', 'LOSE', or None for the game-over transition."""
     global _ble_last_challenge_cmd
 
-    # ── Update controller
+    # Update controller
     wrist_y = hand_state.get('raw_wrist_y')
     out     = challenge_ctrl.update(wrist_y, hand_state)
+    wins    = out.get('session_wins', 0)
 
-    # ── Background based on cumulative session wins
-    bg_key = challenge_ctrl.get_background_key()
-    frame[:] = ASSETS[bg_key]
+    # Camera background — darken more as robot gets angrier
+    darken = 0.35 + 0.15 * (wins / 10)
+    UI.draw_camera_bg(frame, raw_frame, darken=min(darken, 0.60))
 
-    # ── BLE: send robot gesture once per round
+    # Red vignette that grows with anger
+    vig = UI.challenge_vignette_intensity(wins)
+    if vig > 0:
+        pulse = 1.0 if wins < 8 else (0.75 + 0.25 * math.sin(now * 6 * math.pi))
+        UI.vignette(frame, UI.P['red'], vig * pulse)
+
+    # BLE
     if ble is not None and out.get('state') in ('ROUND_RESULT', 'MATCH_RESULT'):
         gest = out.get('computer_gesture', 'Unknown')
         if gest != 'Unknown':
@@ -463,154 +281,75 @@ def draw_challenge(frame, hand_state):
     elif out.get('state') not in ('ROUND_RESULT', 'MATCH_RESULT'):
         _ble_last_challenge_cmd = None
 
-    # ── Bottom bar: ROUND on left, score on right ─────────────────────
-    p_score = out.get('player_score', 0)   # = current streak
-    r_score = out.get('robot_score',  0)   # = high score
+    # Top HUD
+    p_score = out.get('player_score', 0)   # current streak
+    r_score = out.get('robot_score',  0)   # high score
     rn      = out.get('round_number', 1)
+    UI.draw_top_hud(frame, 'CHALLENGE', f'ROUND {rn}',
+                    f'STREAK {p_score}   BEST {r_score}')
 
-    _draw_bottom_bar(frame, alpha=0.70)
+    # Robot face — grows more aggressively with wins
+    mood = _session_wins_to_mood(wins)
+    UI.draw_challenge_robot(frame, mood, now, wins)
 
-    # ROUND N — bottom-left
-    cv2.putText(frame, f"ROUND {rn}",
-                (50, 785),
-                cv2.FONT_HERSHEY_DUPLEX, 0.9, WHITE, 2, cv2.LINE_AA)
-
-    # YOU P — ROBOT R — bottom-right (right-justified)
-    score_str = f"YOU {p_score}  —  ROBOT {r_score}"
-    (sw, _), _ = cv2.getTextSize(score_str, cv2.FONT_HERSHEY_DUPLEX, 0.9, 2)
-    cv2.putText(frame, score_str,
-                (SCREEN_W - sw - 50, 785),
-                cv2.FONT_HERSHEY_DUPLEX, 0.9, WHITE, 2, cv2.LINE_AA)
-
-    # ── Main state text — skip ROUND_INTRO to avoid overlapping character ──
+    # State text / countdown
     state = out.get('state', '')
     main  = out.get('main_text', '')
     sub   = out.get('sub_text',  '')
 
     if state == 'COUNTDOWN':
         beats = out.get('beat_count', 0)
-        label = str(min(beats, 3)) if beats > 0 else "READY"
-        _text_centred(frame, label, SCREEN_H // 2 - 40, scale=3.5)
-    elif state != 'ROUND_INTRO' and main:
-        # ROUND_INTRO text ("ROUND N") is already in the bottom bar — skip it here
-        _text_centred(frame, main, SCREEN_H // 2 - 40, scale=2.2)
+        UI.draw_countdown(frame, str(min(beats, 3)) if beats > 0 else 'READY')
+    elif state == 'ROUND_RESULT' and main:
+        UI.draw_state_pill(frame, main, sub, colour_key='magenta')
+    elif main and state != 'ROUND_INTRO':
+        UI.draw_state_pill(frame, main, sub, colour_key='cyan')
 
-    if sub and state != 'ROUND_INTRO':
-        _text_centred(frame, sub, SCREEN_H // 2 + 40, scale=0.85)
+    # Gesture indicator
+    UI.draw_gesture_indicator(frame, hand_state.get('confirmed_gesture', 'Unknown'))
 
-    # ── Win/lose transition trigger from AppChallengeController
-    trigger = out.get('trigger_game_over')   # 'WIN', 'LOSE', or None
-    return trigger   # caller uses this to change screen
+    return out.get('trigger_game_over')   # 'WIN', 'LOSE', or None
 
 
-# ── MIRROR ────────────────────────────────────────────────────────────────────
+# ── MIRROR ───────────────────────────────────────────────────────────────────
 
-def draw_mirror(frame, hand_state):
-    frame[:] = ASSETS['mirror_bg']
+def draw_mirror(frame, hand_state, raw_frame, now):
+    UI.draw_camera_bg(frame, raw_frame, darken=0.50)
 
-    # Pass landmarks to the mirror state (sends BLE + updates smoothed curls)
-    lm_obj       = hand_state.get('_landmarks')
-    world_lm_obj = hand_state.get('_world_landmarks')
-    mirror_state.update(lm_obj, world_landmarks=world_lm_obj)
+    # Update mirror state
+    mirror_state.update(
+        hand_state.get('_landmarks'),
+        world_landmarks=hand_state.get('_world_landmarks'),
+    )
+    curls = mirror_state.get_display_curls()
 
-    curls = mirror_state.get_display_curls()   # [thumb, index, middle, ring]
+    # Top HUD
+    UI.draw_top_hud(frame, 'MIRROR', 'CURL YOUR FINGERS', '')
 
-    # ── Finger curl bars — bottom-left region (x=40, y≈500..780) ─────────────
-    for i, (label, curl_val) in enumerate(zip(_CURL_LABELS, curls)):
-        y_lbl = _BAR_Y0 + i * _BAR_STEP - 18   # label baseline above bar
-        y_bar = _BAR_Y0 + i * _BAR_STEP         # bar top edge
+    # Curl bars (top-left, below HUD)
+    _draw_mirror_bars(frame, curls)
 
-        # Label in white, scale 0.7
-        cv2.putText(frame, label, (_BAR_X, y_lbl), FONT, 0.7, WHITE, 2, cv2.LINE_AA)
+    # Robot face — neutral, just watching
+    UI.draw_robot_panel(frame, mood='neutral', now=now, gesture_label='MIRROR')
 
-        # Track (dark grey)
-        cv2.rectangle(frame,
-                      (_BAR_X,           y_bar),
-                      (_BAR_X + _BAR_W,  y_bar + _BAR_H),
-                      DARK_GREY, cv2.FILLED)
-
-        # Fill (accent blue) proportional to curl 0-100
-        fill_w = int(_BAR_W * max(0, min(100, curl_val)) / 100)
-        if fill_w > 0:
-            cv2.rectangle(frame,
-                          (_BAR_X,            y_bar),
-                          (_BAR_X + fill_w,   y_bar + _BAR_H),
-                          ACCENT_BGR, cv2.FILLED)
-
-        # Percentage value to the right of the bar
-        pct_txt = f"{curl_val}%"
-        cv2.putText(frame, pct_txt,
-                    (_BAR_X + _BAR_W + 8, y_bar + _BAR_H - 2),
-                    FONT, 0.6, WHITE, 1, cv2.LINE_AA)
-
-    # Gesture indicator bottom-right
-    gest = hand_state.get('confirmed_gesture', 'Unknown')
-    cv2.putText(frame, f"Gesture: {gest}",
-                (SCREEN_W - 320, SCREEN_H - 30),
-                FONT, 0.65, WHITE, 1, cv2.LINE_AA)
+    # Gesture indicator
+    UI.draw_gesture_indicator(frame, hand_state.get('confirmed_gesture', 'Unknown'))
 
 
-# ── WIN / LOSE ────────────────────────────────────────────────────────────────
+# ── WIN / LOSE ───────────────────────────────────────────────────────────────
 
 def draw_result(frame, result_type, now):
-    """
-    result_type: 'win' or 'lose'.
-    Shows the full-screen result background, then overlays a tall semi-transparent
-    panel with the result word, gestures thrown, and (after RESULT_MIN_DISPLAY s)
-    the 'Press ENTER to continue' prompt.
-    """
-    frame[:] = ASSETS['you_win' if result_type == 'win' else 'you_lose']
-
-    result_word = result_type.upper()   # 'WIN' or 'LOSE'
-
-    # ── Tall dark semi-transparent panel covering lower ~56 % of screen ──
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (100, 500), (1180, 780), (0, 0, 0), cv2.FILLED)
-    cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
-
-    # ── Large result word at the top of the panel ─────────────────────
-    word_colour = (255, 220, 50) if result_word == 'WIN' else (80, 80, 220)
-    cv2.putText(frame,
-                result_word,
-                (SCREEN_W // 2 - 100, 560),
-                cv2.FONT_HERSHEY_DUPLEX, 2.5, word_colour, 4, cv2.LINE_AA)
-
-    # ── Gesture labels — larger, easier to read quickly ───────────────
-    cv2.putText(frame,
-                f"YOU threw: {result_player_gesture}",
-                (240, 640),
-                cv2.FONT_HERSHEY_DUPLEX, 1.6, WHITE, 3, cv2.LINE_AA)
-    cv2.putText(frame,
-                f"ROBOT threw: {result_robot_gesture}",
-                (240, 710),
-                cv2.FONT_HERSHEY_DUPLEX, 1.6, (200, 200, 200), 3, cv2.LINE_AA)
-
-    # ── 'Press ENTER' — only visible after RESULT_MIN_DISPLAY seconds ─
-    if now - result_show_time > RESULT_MIN_DISPLAY:
-        cv2.putText(frame,
-                    "Press ENTER to continue",
-                    (440, 760),
-                    FONT, 0.8, (255, 220, 50), 2, cv2.LINE_AA)
-
+    UI.draw_win_lose_screen(
+        frame, result_type,
+        result_player_gesture, result_robot_gesture,
+        result_show_time, now, RESULT_MIN_DISPLAY,
+    )
 
 # =============================================================================
 # Key handler
 # =============================================================================
 
 def handle_keys(key, now):
-    """
-    Update the global screen / menu_sel from a waitKey() result.
-
-    now: time.monotonic() value from the current frame — used to enforce
-         the 2.5-second dismissal lock on the WIN / LOSE screens.
-
-    Navigation:
-        ESC           — back to previous screen
-        ENTER (13/10) — confirm / advance
-        LEFT  (81/2)  — previous menu item
-        RIGHT (83/3)  — next menu item
-        Q             — quit (handled in main loop)
-    """
     global screen, menu_sel
 
     if key in (255, 0xFF, -1 & 0xFF):
@@ -621,7 +360,6 @@ def handle_keys(key, now):
     left  = (key in (81, 2,  ord('a')))
     right = (key in (83, 3,  ord('d')))
 
-    # ── ESC ───────────────────────────────────────────────────────────
     if esc:
         if screen == 'CHEAT':
             cheat_ctrl.reset()
@@ -633,17 +371,14 @@ def handle_keys(key, now):
             mirror_state.stop()
             screen = 'MENU'
         elif screen in ('WIN', 'LOSE'):
-            # Enforce 2.5-second minimum display before allowing dismissal
             if now - result_show_time > RESULT_MIN_DISPLAY:
                 screen = 'MENU'
         elif screen == 'MENU':
             screen = 'TITLE'
 
-    # ── ENTER ─────────────────────────────────────────────────────────
     elif enter:
         if screen == 'TITLE':
             screen = 'MENU'
-
         elif screen == 'MENU':
             if menu_sel == 0:
                 cheat_ctrl.reset()
@@ -654,19 +389,15 @@ def handle_keys(key, now):
             elif menu_sel == 2:
                 mirror_state.start()
                 screen = 'MIRROR'
-
         elif screen in ('WIN', 'LOSE'):
-            # Enforce 2.5-second minimum display before allowing dismissal
             if now - result_show_time > RESULT_MIN_DISPLAY:
                 screen = 'MENU'
 
-    # ── LEFT / RIGHT arrows (menu navigation) ─────────────────────────
     elif left and screen == 'MENU':
         menu_sel = (menu_sel - 1) % 3
 
     elif right and screen == 'MENU':
         menu_sel = (menu_sel + 1) % 3
-
 
 # =============================================================================
 # Camera
@@ -691,32 +422,29 @@ while True:
     if not ret:
         continue
 
-    # Working canvas at screen resolution (filled by each draw function)
     frame = np.zeros((SCREEN_H, SCREEN_W, 3), dtype=np.uint8)
     now   = time.monotonic()
 
-    # ── Hand / gesture detection (every frame, all screens) ──────────
     hand_state = detector.process(raw_frame)
 
-    # ── Screen routing ────────────────────────────────────────────────
     if screen == 'TITLE':
         draw_title(frame, now)
 
     elif screen == 'MENU':
-        draw_menu(frame, menu_sel)
+        draw_menu(frame, menu_sel, now)
 
     elif screen == 'CHEAT':
-        draw_cheat(frame, hand_state, raw_frame)
+        draw_cheat(frame, hand_state, raw_frame, now)
 
     elif screen == 'CHALLENGE':
-        trigger = draw_challenge(frame, hand_state)
-        if trigger:                         # 'WIN' or 'LOSE'
+        trigger = draw_challenge(frame, hand_state, raw_frame, now)
+        if trigger:
             p_gest = challenge_ctrl._game_over_player_gesture or 'Unknown'
             r_gest = challenge_ctrl._game_over_robot_gesture  or 'Unknown'
             _enter_result_screen(trigger, p_gest, r_gest)
 
     elif screen == 'MIRROR':
-        draw_mirror(frame, hand_state)
+        draw_mirror(frame, hand_state, raw_frame, now)
 
     elif screen == 'WIN':
         draw_result(frame, 'win', now)
@@ -724,18 +452,18 @@ while True:
     elif screen == 'LOSE':
         draw_result(frame, 'lose', now)
 
-    # ── Keyboard ──────────────────────────────────────────────────────
     key = cv2.waitKey(1) & 0xFF
     handle_keys(key, now)
-
-    # ── Display ───────────────────────────────────────────────────────
     cv2.imshow(WIN_NAME, frame)
 
     if key == ord('q'):
         print("[quit] Q pressed — exiting")
         break
 
-# ── Teardown ──────────────────────────────────────────────────────────────────
+# =============================================================================
+# Teardown
+# =============================================================================
+
 cap.release()
 cv2.destroyAllWindows()
 if ble is not None:
