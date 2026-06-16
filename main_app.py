@@ -42,6 +42,10 @@ from app_mirror_state    import AppMirrorState
 # ── Visual design system ────────────────────────────────────────────────────
 import ui_renderer as UI
 
+# ── Sound engine ────────────────────────────────────────────────────────────
+import sound_engine as SFX
+SFX.init()
+
 # ── Optional BLE bridge ──────────────────────────────────────────────────────
 try:
     from ble_bridge import BLEBridge
@@ -116,6 +120,24 @@ mirror_state   = AppMirrorState(ble_bridge=ble)
 screen   = 'TITLE'   # TITLE | MENU | CHEAT | CHALLENGE | MIRROR | WIN | LOSE
 menu_sel = 0         # 0=Cheat 1=Challenge 2=Mirror
 
+# ── Sound state tracking — detect transitions so we fire each sound once ─────
+_prev_cheat_state      = 'WAITING_FOR_ROCK'
+_prev_challenge_state  = 'WAITING_FOR_ROCK'
+_prev_beat_ch          = 0
+_prev_beat_chal        = 0
+
+
+def _reset_cheat_sound_state():
+    global _prev_cheat_state, _prev_beat_ch
+    _prev_cheat_state = 'WAITING_FOR_ROCK'
+    _prev_beat_ch     = 0
+
+
+def _reset_challenge_sound_state():
+    global _prev_challenge_state, _prev_beat_chal
+    _prev_challenge_state = 'WAITING_FOR_ROCK'
+    _prev_beat_chal       = 0
+
 
 def _enter_result_screen(screen_name, player_gest='Unknown', robot_gest='Unknown'):
     global screen, result_show_time, result_player_gesture, result_robot_gesture
@@ -123,6 +145,7 @@ def _enter_result_screen(screen_name, player_gest='Unknown', robot_gest='Unknown
     result_show_time      = time.monotonic()
     result_player_gesture = player_gest
     result_robot_gesture  = robot_gest
+    SFX.play('game_win' if screen_name == 'WIN' else 'game_lose')
 
 # =============================================================================
 # Mirror-mode curl bars (drawn inline, styled with neon palette)
@@ -186,7 +209,7 @@ def draw_menu(frame, sel, now):
 # ── CHEAT ────────────────────────────────────────────────────────────────────
 
 def draw_cheat(frame, hand_state, raw_frame, now):
-    global _ble_last_cheat_cmd
+    global _ble_last_cheat_cmd, _prev_cheat_state, _prev_beat_ch
 
     # Full-screen camera background (slightly darkened)
     UI.draw_camera_bg(frame, raw_frame, darken=0.45)
@@ -194,6 +217,19 @@ def draw_cheat(frame, hand_state, raw_frame, now):
     # Update controller
     wrist_y = hand_state.get('raw_wrist_y')
     out     = cheat_ctrl.update(wrist_y, hand_state)
+
+    # ── Sound triggers (fire once per state transition / beat) ─────────
+    state = out.get('state', '')
+    beats = out.get('beat_count', 0)
+    if state != _prev_cheat_state:
+        if state == 'COUNTDOWN':
+            SFX.play('rock_ready')
+        elif state == 'SHOOT_WINDOW':
+            SFX.play('shoot')
+    if state == 'COUNTDOWN' and beats != _prev_beat_ch and 1 <= beats <= 3:
+        SFX.play('beat')
+    _prev_cheat_state = state
+    _prev_beat_ch     = beats
 
     # BLE — send once per round when result first arrives
     if ble is not None and out.get('state') == 'ROUND_RESULT':
@@ -250,12 +286,28 @@ def _session_wins_to_mood(wins):
 
 def draw_challenge(frame, hand_state, raw_frame, now):
     """Returns 'WIN', 'LOSE', or None for the game-over transition."""
-    global _ble_last_challenge_cmd
+    global _ble_last_challenge_cmd, _prev_challenge_state, _prev_beat_chal
 
     # Update controller
     wrist_y = hand_state.get('raw_wrist_y')
     out     = challenge_ctrl.update(wrist_y, hand_state)
     wins    = out.get('session_wins', 0)
+
+    # ── Sound triggers ──────────────────────────────────────────────────
+    state = out.get('state', '')
+    beats = out.get('beat_count', 0)
+    if state != _prev_challenge_state:
+        if state == 'COUNTDOWN':
+            SFX.play('rock_ready')
+        elif state == 'SHOOT_WINDOW':
+            SFX.play('shoot')
+        elif state == 'ROUND_RESULT':
+            result = getattr(challenge_ctrl, 'last_round_result', None)
+            SFX.play('round_win' if result == 'player_win' else 'round_lose')
+    if state == 'COUNTDOWN' and beats != _prev_beat_chal and 1 <= beats <= 3:
+        SFX.play('beat')
+    _prev_challenge_state = state
+    _prev_beat_chal       = beats
 
     # Camera background — darken more as robot gets angrier
     darken = 0.35 + 0.15 * (wins / 10)
@@ -363,28 +415,38 @@ def handle_keys(key, now):
     if esc:
         if screen == 'CHEAT':
             cheat_ctrl.reset()
+            _reset_cheat_sound_state()
             screen = 'MENU'
+            SFX.play('menu_tick')
         elif screen == 'CHALLENGE':
             challenge_ctrl.reset()
+            _reset_challenge_sound_state()
             screen = 'MENU'
+            SFX.play('menu_tick')
         elif screen == 'MIRROR':
             mirror_state.stop()
             screen = 'MENU'
+            SFX.play('menu_tick')
         elif screen in ('WIN', 'LOSE'):
             if now - result_show_time > RESULT_MIN_DISPLAY:
                 screen = 'MENU'
         elif screen == 'MENU':
             screen = 'TITLE'
+            SFX.play('menu_tick')
 
     elif enter:
         if screen == 'TITLE':
             screen = 'MENU'
+            SFX.play('menu_tick')
         elif screen == 'MENU':
+            SFX.play('menu_tick')
             if menu_sel == 0:
                 cheat_ctrl.reset()
+                _reset_cheat_sound_state()
                 screen = 'CHEAT'
             elif menu_sel == 1:
                 challenge_ctrl.reset()
+                _reset_challenge_sound_state()
                 screen = 'CHALLENGE'
             elif menu_sel == 2:
                 mirror_state.start()
@@ -395,9 +457,11 @@ def handle_keys(key, now):
 
     elif left and screen == 'MENU':
         menu_sel = (menu_sel - 1) % 3
+        SFX.play('menu_tick')
 
     elif right and screen == 'MENU':
         menu_sel = (menu_sel + 1) % 3
+        SFX.play('menu_tick')
 
 # =============================================================================
 # Camera
