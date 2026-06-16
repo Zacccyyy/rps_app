@@ -40,7 +40,7 @@ from app_challenge_state import AppChallengeController
 from app_mirror_state    import AppMirrorState
 
 # ── Visual design system ────────────────────────────────────────────────────
-import ui_renderer as UI
+import rps_ui as UI
 
 # ── Sound engine ────────────────────────────────────────────────────────────
 import sound_engine as SFX
